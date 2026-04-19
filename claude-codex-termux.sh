@@ -54,6 +54,7 @@ if [ "$action" = "install" ]; then
     MISSING=()
     command -v curl    >/dev/null 2>&1 || MISSING+=(curl)
     command -v rg      >/dev/null 2>&1 || MISSING+=(ripgrep)
+    command -v which   >/dev/null 2>&1 || MISSING+=(which)
     command -v python3 >/dev/null 2>&1 || MISSING+=(python)
     command -v node    >/dev/null 2>&1 || MISSING+=(nodejs)
     command -v objcopy >/dev/null 2>&1 || MISSING+=(binutils)
@@ -252,7 +253,7 @@ CA_BUNDLE="\${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}"
 # Termux doesn't ship; point it at an existing (cert-free) dir to silence the
 # "Cannot open directory" warning. Real trust anchors come from SSL_CERT_FILE.
 CA_DIR="\${SSL_CERT_DIR:-$PREFIX/etc/tls}"
-exec env USE_BUILTIN_RIPGREP=0 DISABLE_AUTOUPDATER=1 \\
+exec env USE_BUILTIN_RIPGREP=0 DISABLE_AUTOUPDATER=1 DISABLE_INSTALLATION_CHECKS=1 \\
     TMPDIR="\$TMPDIR" CLAUDE_CODE_TMPDIR="\$CLAUDE_CODE_TMPDIR" CLAUDE_TMPDIR="\$CLAUDE_TMPDIR" \\
     SSL_CERT_FILE="\$CA_BUNDLE" NODE_EXTRA_CA_CERTS="\$CA_BUNDLE" SSL_CERT_DIR="\$CA_DIR" \\
     node "$CLAUDE_CLI" "\$@"
