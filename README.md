@@ -35,9 +35,8 @@ bash claude-codex-termux.sh uninstall codex
 
 # what the script does
 
-- Downloads the latest musl libc from Alpine's aarch64 repo and the latest Claude Code binary from `downloads.claude.ai`
 - Downloads the latest Codex CLI release from GitHub (`openai/codex`)
 - Patches each binary's hardcoded `/etc/resolv.conf` string to `/proc/self/fd/9\0`.
 - Generates the resolver file from Android's `net.dns*` system properties, falling back to `1.1.1.1` / `8.8.8.8`
-- Installs binaries to `~/.local/lib/{musl-claude,codex}` and wrappers to `~/.local/bin/{claude,codex}`
+- Installs binaries to `~/.local/lib/{claude-code,codex}` and wrappers to `~/.local/bin/{claude,codex}`
 - Appends a guarded `PATH` block to `~/.bashrc`, `~/.zshrc`, and `~/.config/fish/config.fish`

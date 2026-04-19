@@ -9,10 +9,9 @@ PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 USER_BIN="$HOME/.local/bin"
 USER_LIB="$HOME/.local/lib"
 
-MUSL_DIR="$USER_LIB/musl-claude"
-CLAUDE_BIN="$MUSL_DIR/claude"
-CLAUDE_VERSION_MARKER="$MUSL_DIR/.installed-version"
-CLAUDE_RESOLV_CONF="$HOME/.config/claude/resolv.conf"
+CLAUDE_PKG_DIR="$USER_LIB/claude-code"
+CLAUDE_CLI="$CLAUDE_PKG_DIR/cli.js"
+CLAUDE_VERSION_MARKER="$CLAUDE_PKG_DIR/.installed-version"
 
 CODEX_DIR="$USER_LIB/codex"
 CODEX_BIN="$CODEX_DIR/codex"
@@ -53,8 +52,11 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 if [ "$action" = "install" ]; then
     step "0/1" "Checking prerequisites..."
     MISSING=()
-    command -v curl >/dev/null 2>&1 || MISSING+=(curl)
-    command -v rg   >/dev/null 2>&1 || MISSING+=(ripgrep)
+    command -v curl    >/dev/null 2>&1 || MISSING+=(curl)
+    command -v rg      >/dev/null 2>&1 || MISSING+=(ripgrep)
+    command -v python3 >/dev/null 2>&1 || MISSING+=(python)
+    command -v node    >/dev/null 2>&1 || MISSING+=(nodejs)
+    command -v objcopy >/dev/null 2>&1 || MISSING+=(binutils)
     [ -f "$PREFIX/etc/tls/cert.pem" ] || MISSING+=(ca-certificates)
 
     if [ ${#MISSING[@]} -gt 0 ]; then
@@ -112,58 +114,148 @@ patch_resolv_conf_binary() {
 install_claude() {
     section "Claude Code"
 
-    step "claude 1/4" "Finding latest musl version from Alpine..."
-    INDEX=$("${CURL[@]}" "https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/aarch64/")
-    MUSL_APK=$(echo "$INDEX" | grep -o 'musl-[0-9][^"]*\.apk' | grep -v 'musl-dev\|musl-dbg' | sort -V | tail -1)
-    [ -n "$MUSL_APK" ] || { err "Could not find musl apk in Alpine index"; exit 1; }
-    echo "    Found: $MUSL_APK"
-
-    step "claude 2/4" "Resolving latest Claude Code version..."
+    step "claude 1/4" "Resolving latest Claude Code version..."
     VERSION=$("${CURL[@]}" "https://downloads.claude.ai/claude-code-releases/latest")
     [ -n "$VERSION" ] || { err "Could not resolve latest Claude Code version"; exit 1; }
     echo "    Version: $VERSION"
 
-    INSTALL_TAG="$MUSL_APK|$VERSION"
-    if [ "${FORCE_INSTALL_CC_CODEX:-0}" != "1" ] && [ -f "$CLAUDE_VERSION_MARKER" ] && [ "$(cat "$CLAUDE_VERSION_MARKER")" = "$INSTALL_TAG" ] && [ -x "$CLAUDE_BIN" ]; then
-        step "claude 3/4" "Already up to date, skipping download."
+    MANIFEST_URL="https://downloads.claude.ai/claude-code-releases/$VERSION/manifest.json"
+    BIN_URL="https://downloads.claude.ai/claude-code-releases/$VERSION/linux-arm64/claude"
+    CHECKSUM=$("${CURL[@]}" "$MANIFEST_URL" \
+        | python3 -c "import json,sys; print(json.load(sys.stdin)['platforms']['linux-arm64']['checksum'])")
+    [ -n "$CHECKSUM" ] || { err "Could not resolve checksum from manifest"; exit 1; }
+
+    INSTALL_TAG="$VERSION|$CHECKSUM"
+    if [ "${FORCE_INSTALL_CC_CODEX:-0}" != "1" ] \
+        && [ -f "$CLAUDE_VERSION_MARKER" ] \
+        && [ "$(cat "$CLAUDE_VERSION_MARKER")" = "$INSTALL_TAG" ] \
+        && [ -x "$CLAUDE_CLI" ]; then
+        step "claude 2/4" "Already up to date, skipping."
     else
-        rm -rf "$MUSL_DIR"
+        step "claude 2/4" "Downloading bun-packaged linux-arm64 binary..."
+        rm -rf "$CLAUDE_PKG_DIR"
         rm -f "$USER_BIN/claude"
-        mkdir -p "$MUSL_DIR"
-        step "claude 3/4" "Downloading musl + Claude Code..."
-        "${CURL[@]}" "https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/aarch64/$MUSL_APK" -o "$TMP_DIR/musl.apk"
-        tar --warning=no-unknown-keyword -xf "$TMP_DIR/musl.apk" -C "$MUSL_DIR"
-        "${CURL[@]}" "https://downloads.claude.ai/claude-code-releases/$VERSION/linux-arm64-musl/claude" -o "$CLAUDE_BIN"
-        chmod +x "$CLAUDE_BIN"
-        sha256sum "$CLAUDE_BIN" | awk '{print "    claude sha256: "$1}'
+        mkdir -p "$CLAUDE_PKG_DIR"
+        "${CURL[@]}" "$BIN_URL" -o "$TMP_DIR/claude-bin"
+        echo "$CHECKSUM  $TMP_DIR/claude-bin" | sha256sum -c - >/dev/null
+        echo "    checksum OK: $CHECKSUM"
+
+        step "claude 3/4" "Extracting .bun section and patching cli.js..."
+        objcopy -O binary --only-section=.bun "$TMP_DIR/claude-bin" "$TMP_DIR/bun.section"
+        python3 - "$TMP_DIR/bun.section" "$CLAUDE_CLI" <<'EXTRACT'
+import re, struct, sys
+section_path, out_path = sys.argv[1], sys.argv[2]
+with open(section_path, 'rb') as f:
+    data = f.read()
+
+marker = b'file:///$bunfs/root/src/entrypoints/cli.js'
+i = data.find(marker)
+if i < 0:
+    sys.exit('cli.js marker not found in .bun section')
+start = data.find(b'// @bun', i)
+if start < 0:
+    sys.exit('bundle start not found after entrypoint marker')
+size = struct.unpack('<I', data[start - 4:start])[0]
+src = data[start:start + size].decode('utf-8')
+
+head = '// @bun @bytecode @bun-cjs\n(function(exports, require, module, __filename, __dirname) {'
+tail = '})\n'
+if not src.startswith(head) or not src.endswith(tail):
+    sys.exit('unexpected CJS wrapper shape around cli.js')
+body = src[len(head):-len(tail)]
+
+SENTINEL = 'process.env.CLAUDE_TMPDIR||"/tmp/claude"'
+BRIDGE_DONE = 'claude-mcp-browser-bridge-'
+BRIDGE_DONE_MARKER = 'process.env.CLAUDE_CODE_TMPDIR||process.env.TMPDIR||"/tmp"'
+
+# Patch 1: sandbox tmp allowlist (literal match)
+frm1 = '"/tmp/claude","/private/tmp/claude"'
+to1 = ('(process.env.CLAUDE_TMPDIR||"/tmp/claude"),'
+       '(process.env.CLAUDE_TMPDIR||"/private/tmp/claude")')
+n1 = body.count(frm1)
+if n1 == 0:
+    if SENTINEL in body:
+        print('    already patched: sandbox tmp allowlist')
+    else:
+        sys.exit(f'patch target not found: {frm1}')
+elif n1 > 1:
+    sys.exit(f'patch 1 matched {n1} times')
+else:
+    body = body.replace(frm1, to1)
+    print('    patched: sandbox tmp allowlist')
+
+# Patch 2: browser bridge tmpdir (regex — function name is minified, varies per build)
+pat2 = re.compile(r'`/tmp/claude-mcp-browser-bridge-\$\{([A-Za-z_$][\w$]*)\(\)\}`')
+matches = pat2.findall(body)
+if not matches:
+    if BRIDGE_DONE in body and BRIDGE_DONE_MARKER in body:
+        print('    already patched: browser bridge tmpdir')
+    else:
+        sys.exit('patch target not found: /tmp/claude-mcp-browser-bridge-${<fn>()}')
+elif len(set(matches)) > 1:
+    sys.exit(f'browser-bridge fn name ambiguous: {sorted(set(matches))}')
+elif len(matches) > 1:
+    sys.exit(f'browser-bridge pattern matched {len(matches)} times')
+else:
+    fn = matches[0]
+    body = pat2.sub(
+        '`${process.env.CLAUDE_CODE_TMPDIR||process.env.TMPDIR||"/tmp"}'
+        '/claude-mcp-browser-bridge-${' + fn + '()}`',
+        body,
+    )
+    print(f'    patched: browser bridge tmpdir (fn={fn})')
+
+out = '#!/usr/bin/env node\n/* __CLAUDE_TERMUX_RUNTIME_PATCHED__ */\n' + body
+with open(out_path, 'w') as f:
+    f.write(out)
+print(f'    wrote {out_path} ({len(out)} bytes)')
+EXTRACT
+        chmod +x "$CLAUDE_CLI"
+        sha256sum "$CLAUDE_CLI" | awk '{print "    cli.js sha256: "$1}'
+
+        # Bun resolves these as built-ins at runtime; Node needs real packages
+        # installed as siblings of cli.js. node-fetch pinned to v2 (v3 is ESM
+        # and the bundle uses CJS require).
+        cat > "$CLAUDE_PKG_DIR/package.json" <<'PKG'
+{
+  "name": "claude-code-termux-runtime",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "ajv": "^8",
+    "ajv-formats": "^3",
+    "node-fetch": "^2",
+    "undici": "^6",
+    "ws": "^8",
+    "yaml": "^2"
+  }
+}
+PKG
+        echo "    Installing runtime shims (ws, undici, yaml, ajv, ajv-formats, node-fetch)..."
+        (cd "$CLAUDE_PKG_DIR" && npm install --omit=dev --no-audit --no-fund --loglevel=error)
     fi
 
-    MUSL_LD="$MUSL_DIR/lib/libc.musl-aarch64.so.1"
-    [ -f "$MUSL_LD" ] || { err "musl linker not found at $MUSL_LD"; exit 1; }
-
-    step "claude 4/4" "Patching binaries + writing resolver/wrapper..."
-    patch_resolv_conf_binary "$CLAUDE_BIN"
-    patch_resolv_conf_binary "$MUSL_LD"
-    write_resolver_file "$CLAUDE_RESOLV_CONF"
-
+    step "claude 4/4" "Writing wrapper..."
     mkdir -p "$USER_BIN"
     cat > "$USER_BIN/claude" <<WRAPPER
 #!/usr/bin/env bash
-# USE_BUILTIN_RIPGREP=0: bundled musl rg doesn't index correctly on Termux.
-# LD_PRELOAD=: clear Termux preloads that conflict with the musl loader.
-# FD 9: binary patched to read resolv.conf from /proc/self/fd/9.
+# USE_BUILTIN_RIPGREP=0: bundled rg vendor path isn't shipped with the
+# extracted cli.js, so defer to the Termux pkg \`rg\` on PATH.
+# CLAUDE_*TMPDIR: the cli.js is patched to honor these; Termux has no
+# writable /tmp in app context, so anchor them under \$PREFIX/tmp.
 TMPDIR="\${TMPDIR:-$PREFIX/tmp}"
 CLAUDE_CODE_TMPDIR="\${CLAUDE_CODE_TMPDIR:-\$TMPDIR}"
 CLAUDE_TMPDIR="\${CLAUDE_TMPDIR:-\$TMPDIR/claude}"
-CLAUDE_RESOLV_CONF="\${CLAUDE_RESOLV_CONF:-$CLAUDE_RESOLV_CONF}"
-if [ ! -f "\$CLAUDE_RESOLV_CONF" ]; then
-    printf '%s\n' "Claude resolver file not found: \$CLAUDE_RESOLV_CONF" >&2
-    exit 1
-fi
-exec env USE_BUILTIN_RIPGREP=0 DISABLE_AUTOUPDATER=1 LD_PRELOAD= \\
+mkdir -p "\$CLAUDE_TMPDIR"
+CA_BUNDLE="\${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}"
+# SSL_CERT_DIR: Bun's bundled OpenSSL probes a compiled-in certs/ dir that
+# Termux doesn't ship; point it at an existing (cert-free) dir to silence the
+# "Cannot open directory" warning. Real trust anchors come from SSL_CERT_FILE.
+CA_DIR="\${SSL_CERT_DIR:-$PREFIX/etc/tls}"
+exec env USE_BUILTIN_RIPGREP=0 DISABLE_AUTOUPDATER=1 \\
     TMPDIR="\$TMPDIR" CLAUDE_CODE_TMPDIR="\$CLAUDE_CODE_TMPDIR" CLAUDE_TMPDIR="\$CLAUDE_TMPDIR" \\
-    "$MUSL_LD" "$CLAUDE_BIN" "\$@" \\
-    9<"\$CLAUDE_RESOLV_CONF"
+    SSL_CERT_FILE="\$CA_BUNDLE" NODE_EXTRA_CA_CERTS="\$CA_BUNDLE" SSL_CERT_DIR="\$CA_DIR" \\
+    node "$CLAUDE_CLI" "\$@"
 WRAPPER
     chmod +x "$USER_BIN/claude"
 
@@ -280,7 +372,12 @@ uninstall_paths() {
 }
 
 if [ "$action" = "uninstall" ]; then
-    [ "$DO_CLAUDE" = "1" ] && uninstall_paths "Claude Code" "$USER_BIN/claude" "$MUSL_DIR" "$CLAUDE_RESOLV_CONF"
+    [ "$DO_CLAUDE" = "1" ] && uninstall_paths "Claude Code" \
+        "$USER_BIN/claude" "$CLAUDE_PKG_DIR" \
+        "$USER_LIB/glibc-claude" "$USER_LIB/musl-claude" "$USER_LIB/claude-code" \
+        "$HOME/.config/claude/resolv.conf" \
+        "$HOME/.config/claude/nsswitch.conf" \
+        "$HOME/.config/claude/hosts"
     [ "$DO_CODEX" = "1" ]  && uninstall_paths "Codex CLI"   "$USER_BIN/codex"  "$CODEX_DIR" "$CODEX_RESOLV_CONF"
     printf '\nDone. Auth/config dirs (~/.claude, ~/.codex) and rc-file PATH entries\n'
     echo "left intact."
