@@ -115,8 +115,11 @@ patch_resolv_conf_binary() {
 install_claude() {
     section "Claude Code"
 
-    step "claude 1/4" "Resolving latest Claude Code version..."
-    VERSION=$("${CURL[@]}" "https://downloads.claude.ai/claude-code-releases/latest")
+    step "claude 1/4" "Resolving Claude Code version..."
+    VERSION="${CLAUDE_RELEASE_VERSION:-latest}"
+    if [ "$VERSION" = "latest" ]; then
+        VERSION=$("${CURL[@]}" "https://downloads.claude.ai/claude-code-releases/latest")
+    fi
     [ -n "$VERSION" ] || { err "Could not resolve latest Claude Code version"; exit 1; }
     echo "    Version: $VERSION"
 
@@ -156,8 +159,24 @@ if i < 0:
 start = data.find(b'// @bun', i)
 if start < 0:
     sys.exit('bundle start not found after entrypoint marker')
-size = struct.unpack('<I', data[start - 4:start])[0]
-src = data[start:start + size].decode('utf-8')
+end = -1
+
+# Older Bun standalone payloads stored the module length in the four bytes
+# before the source. Current Claude builds delimit modules with NUL-separated
+# file names instead. Accept either layout so the extractor survives upstream
+# packaging changes.
+if start >= 4:
+    size = struct.unpack('<I', data[start - 4:start])[0]
+    candidate_end = start + size
+    if candidate_end <= len(data) and data[start:candidate_end].endswith(b'})\n'):
+        end = candidate_end
+
+if end < 0:
+    end = data.find(b'\0', start)
+    if end < 0:
+        sys.exit('bundle end not found after cli.js source')
+
+src = data[start:end].decode('utf-8')
 
 head = '// @bun @bytecode @bun-cjs\n(function(exports, require, module, __filename, __dirname) {'
 tail = '})\n'
@@ -206,7 +225,138 @@ else:
     )
     print(f'    patched: browser bridge tmpdir (fn={fn})')
 
-out = '#!/usr/bin/env node\n/* __CLAUDE_TERMUX_RUNTIME_PATCHED__ */\n' + body
+node_shim = r'''
+(() => {
+  if (globalThis.Bun) return;
+  const childProcess = require("child_process");
+  const fs = require("fs");
+  const path = require("path");
+  let stringWidth;
+  let stripAnsi;
+  let wrapAnsi;
+  let semver;
+  let which;
+  let yaml;
+  const originalReadFileSync = fs.readFileSync;
+  fs.readFileSync = function patchedReadFileSync(file, options) {
+    if (String(file) === "/proc/version") {
+      try {
+        return originalReadFileSync.apply(this, arguments);
+      } catch (error) {
+        if (error && error.code === "EACCES") return "Linux version 0.0.0-termux\n";
+        throw error;
+      }
+    }
+    return originalReadFileSync.apply(this, arguments);
+  };
+  function loadStringWidth() {
+    if (!stringWidth) stringWidth = require("string-width");
+    return stringWidth;
+  }
+  function loadStripAnsi() {
+    if (!stripAnsi) stripAnsi = require("strip-ansi");
+    return stripAnsi;
+  }
+  function loadWrapAnsi() {
+    if (!wrapAnsi) wrapAnsi = require("wrap-ansi");
+    return wrapAnsi;
+  }
+  function loadSemver() {
+    if (!semver) semver = require("semver");
+    return semver;
+  }
+  function loadWhich() {
+    if (!which) which = require("which");
+    return which;
+  }
+  function loadYaml() {
+    if (!yaml) yaml = require("yaml");
+    return yaml;
+  }
+  function hashString(value, seed = 0) {
+    let h = seed >>> 0 || 2166136261;
+    for (let i = 0; i < value.length; i++) {
+      h ^= value.charCodeAt(i);
+      h = Math.imul(h, 16777619) >>> 0;
+    }
+    return h;
+  }
+  globalThis.Bun = {
+    gc() {
+      if (globalThis.gc) globalThis.gc();
+    },
+    hash(value, seed) {
+      return hashString(String(value), seed);
+    },
+    spawn(cmd, options = {}) {
+      const child = childProcess.spawn(cmd[0], cmd.slice(1), {
+        cwd: options.cwd,
+        env: options.env,
+        detached: options.detached,
+        shell: options.shell,
+        stdio: options.stdio,
+        windowsHide: options.windowsHide,
+      });
+      child.exited = new Promise((resolve) => {
+        child.on("exit", (code) => resolve(code ?? 0));
+      });
+      return child;
+    },
+    embeddedFiles: [],
+    stringWidth(value, options) {
+      return loadStringWidth()(String(value), options);
+    },
+    stripANSI(value) {
+      return loadStripAnsi()(String(value));
+    },
+    wrapAnsi(value, width, options) {
+      return loadWrapAnsi()(String(value), width, options);
+    },
+    semver: {
+      order(a, b) {
+        return loadSemver().compare(a, b);
+      },
+      satisfies(version, range) {
+        return loadSemver().satisfies(version, range);
+      },
+    },
+    YAML: {
+      parse(value) {
+        return loadYaml().parse(String(value));
+      },
+      stringify(value) {
+        return loadYaml().stringify(value);
+      },
+    },
+    which(command) {
+      try {
+        return loadWhich().sync(command);
+      } catch {
+        return null;
+      }
+    },
+    Transpiler: class {
+      transformSync(value) {
+        return String(value);
+      }
+    },
+    JSONL: class {
+      constructor(pathname) {
+        this.pathname = pathname;
+      }
+      write(value) {
+        fs.appendFileSync(this.pathname, JSON.stringify(value) + "\n");
+      }
+    },
+    generateHeapSnapshot() {
+      return path.join(process.env.TMPDIR || "/tmp", "claude-node-heap.heapsnapshot");
+    },
+    version: process.version,
+  };
+})();
+'''
+
+out = '#!/usr/bin/env node\n/* __CLAUDE_TERMUX_RUNTIME_PATCHED__ */\n' + node_shim + '\n' + body
 with open(out_path, 'w') as f:
     f.write(out)
 print(f'    wrote {out_path} ({len(out)} bytes)')
@@ -226,13 +376,18 @@ EXTRACT
     "ajv": "^8",
     "ajv-formats": "^3",
     "node-fetch": "^2",
+    "semver": "^7",
+    "string-width": "^4",
+    "strip-ansi": "^6",
     "undici": "^6",
+    "which": "^3",
+    "wrap-ansi": "^7",
     "ws": "^8",
     "yaml": "^2"
   }
 }
 PKG
-        echo "    Installing runtime shims (ws, undici, yaml, ajv, ajv-formats, node-fetch)..."
+        echo "    Installing runtime shims (ws, undici, yaml, ajv, ajv-formats, node-fetch, semver, string-width, strip-ansi, which, wrap-ansi)..."
         (cd "$CLAUDE_PKG_DIR" && npm install --omit=dev --no-audit --no-fund --loglevel=error)
     fi
 
@@ -315,7 +470,22 @@ if [ ! -f "\$CODEX_RESOLV_CONF" ]; then
     exit 1
 fi
 export SSL_CERT_FILE="\${SSL_CERT_FILE:-$PREFIX/etc/tls/cert.pem}"
-exec "\$CODEX_BIN" "\$@" 9<"\$CODEX_RESOLV_CONF"
+termux_sandbox_args=()
+if [ "\${CODEX_TERMUX_DEFAULT_SANDBOX:-danger-full-access}" != "preserve" ]; then
+    has_sandbox_arg=0
+    for arg in "\$@"; do
+        case "\$arg" in
+            -s|--sandbox|--sandbox=*|--dangerously-bypass-approvals-and-sandbox|--yolo)
+                has_sandbox_arg=1
+                break
+                ;;
+        esac
+    done
+    if [ "\$has_sandbox_arg" = "0" ]; then
+        termux_sandbox_args=(--sandbox "\${CODEX_TERMUX_DEFAULT_SANDBOX:-danger-full-access}")
+    fi
+fi
+exec "\$CODEX_BIN" "\${termux_sandbox_args[@]}" "\$@" 9<"\$CODEX_RESOLV_CONF"
 WRAPPER
     chmod +x "$USER_BIN/codex"
 
@@ -324,10 +494,13 @@ WRAPPER
 
 PATH_MARKER_BEGIN="# >>> cc-termux PATH >>>"
 PATH_MARKER_END="# <<< cc-termux PATH <<<"
+CLAUDE_TMPDIR_MARKER_BEGIN="# >>> claude-code-termux-tmpdir >>>"
+CLAUDE_TMPDIR_MARKER_END="# <<< claude-code-termux-tmpdir <<<"
 
 add_path_to_rc() {
     local rc="$1" block="$2"
-    if [ -f "$rc" ] && grep -qF "$PATH_MARKER_BEGIN" "$rc"; then
+    local marker="${3:-$PATH_MARKER_BEGIN}"
+    if [ -f "$rc" ] && grep -qF "$marker" "$rc"; then
         echo "    $rc: already configured"
         return
     fi
@@ -362,6 +535,50 @@ $PATH_MARKER_END"
     add_path_to_rc "$HOME/.config/fish/config.fish" "$fish_block"
 }
 
+setup_claude_tmpdir_env() {
+    section "Claude tmpdir"
+
+    local zshenv_block sh_block fish_block
+    zshenv_block="$CLAUDE_TMPDIR_MARKER_BEGIN
+# On Termux/Android, /tmp is not writable by app processes.
+# ~/.zshenv is used because Claude Code launches non-interactive zsh shells.
+if [ -n \"\${PREFIX:-}\" ] && [ -d \"\$PREFIX/tmp\" ]; then
+    export TMPDIR=\"\${TMPDIR:-\$PREFIX/tmp}\"
+    export CLAUDE_CODE_TMPDIR=\"\${CLAUDE_CODE_TMPDIR:-\$TMPDIR}\"
+    export CLAUDE_TMPDIR=\"\${CLAUDE_TMPDIR:-\$TMPDIR/claude}\"
+fi
+$CLAUDE_TMPDIR_MARKER_END"
+
+    sh_block="$CLAUDE_TMPDIR_MARKER_BEGIN
+# Keep interactive shells aligned with the Termux TMPDIR workaround.
+if [ -n \"\${PREFIX:-}\" ] && [ -d \"\$PREFIX/tmp\" ]; then
+    export TMPDIR=\"\${TMPDIR:-\$PREFIX/tmp}\"
+    export CLAUDE_CODE_TMPDIR=\"\${CLAUDE_CODE_TMPDIR:-\$TMPDIR}\"
+    export CLAUDE_TMPDIR=\"\${CLAUDE_TMPDIR:-\$TMPDIR/claude}\"
+fi
+$CLAUDE_TMPDIR_MARKER_END"
+
+    fish_block="$CLAUDE_TMPDIR_MARKER_BEGIN
+# Keep Fish shells aligned with the Termux TMPDIR workaround.
+if set -q PREFIX; and test -d \"\$PREFIX/tmp\"
+    if test -z \"\$TMPDIR\"
+        set -gx TMPDIR \"\$PREFIX/tmp\"
+    end
+    if test -z \"\$CLAUDE_CODE_TMPDIR\"
+        set -gx CLAUDE_CODE_TMPDIR \"\$TMPDIR\"
+    end
+    if test -z \"\$CLAUDE_TMPDIR\"
+        set -gx CLAUDE_TMPDIR \"\$TMPDIR/claude\"
+    end
+end
+$CLAUDE_TMPDIR_MARKER_END"
+
+    add_path_to_rc "$HOME/.zshenv" "$zshenv_block" "$CLAUDE_TMPDIR_MARKER_BEGIN"
+    add_path_to_rc "$HOME/.zshrc" "$sh_block" "$CLAUDE_TMPDIR_MARKER_BEGIN"
+    add_path_to_rc "$HOME/.bashrc" "$sh_block" "$CLAUDE_TMPDIR_MARKER_BEGIN"
+    add_path_to_rc "$HOME/.config/fish/config.fish" "$fish_block" "$CLAUDE_TMPDIR_MARKER_BEGIN"
+}
+
 uninstall_paths() {
     section "Uninstall $1"
     shift
@@ -387,6 +604,7 @@ fi
 
 [ "$DO_CLAUDE" = "1" ] && install_claude
 [ "$DO_CODEX" = "1" ] && install_codex
+[ "$DO_CLAUDE" = "1" ] && setup_claude_tmpdir_env
 setup_shell_path
 
 printf '\nDone.\n'
@@ -401,5 +619,9 @@ case ":${PATH:-}:" in
         esac
         ;;
 esac
-[ "$DO_CLAUDE" = "1" ] && echo "  Run: claude"
-[ "$DO_CODEX" = "1" ] && echo "  Run: codex"
+if [ "$DO_CLAUDE" = "1" ]; then
+    echo "  Run: claude"
+fi
+if [ "$DO_CODEX" = "1" ]; then
+    echo "  Run: codex"
+fi

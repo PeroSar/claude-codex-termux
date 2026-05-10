@@ -31,7 +31,9 @@ bash claude-codex-termux.sh uninstall codex
 # environment variables
 
 - `FORCE_INSTALL_CC_CODEX=1`: reinstall even if the version marker already matches the latest upstream version
-- `CODEX_RELEASE_TAG=vX.Y.Z`: pin a specific Codex release tag instead of resolving `latest` from GitHub
+- `CLAUDE_RELEASE_VERSION=2.1.138`: install a specific Claude Code release. Defaults to `latest`.
+- `CODEX_RELEASE_TAG=rust-vX.Y.Z`: pin a specific Codex release tag instead of resolving `latest` from GitHub
+- `CODEX_TERMUX_DEFAULT_SANDBOX=preserve`: do not add Termux's default `--sandbox danger-full-access` to the Codex wrapper
 
 # what the script does
 
@@ -39,4 +41,5 @@ bash claude-codex-termux.sh uninstall codex
 - Patches each binary's hardcoded `/etc/resolv.conf` string to `/proc/self/fd/9\0`.
 - Generates the resolver file from Android's `net.dns*` system properties, falling back to `1.1.1.1` / `8.8.8.8`
 - Installs binaries to `~/.local/lib/{claude-code,codex}` and wrappers to `~/.local/bin/{claude,codex}`
+- Makes the Codex wrapper default to `--sandbox danger-full-access` on Termux, because stock Android does not provide Codex's bubblewrap sandbox prerequisites. Explicit `--sandbox` / `-s` arguments are left alone.
 - Appends a guarded `PATH` block to `~/.bashrc`, `~/.zshrc`, and `~/.config/fish/config.fish`
